@@ -1,14 +1,17 @@
-use prusti_interface::specs::is_spec_fn;
+use pcg::borrow_pcg::FunctionData;
+use prusti_interface::{PrustiError, specs::is_spec_fn};
 use prusti_rustc_interface::{
     middle::{mir, ty},
     span::def_id::DefId,
 };
-use task_encoder::{EncodeFullResult, OutputRefAny, TaskEncoder, TaskEncoderDependencies};
+use task_encoder::{
+    EncodeFullError, EncodeFullResult, OutputRefAny, TaskEncoder, TaskEncoderDependencies,
+};
 use vir::{FunctionIdn, MethodIdn, ViperIdent, vir_format_identifier};
 
 use crate::{
     encoders::{
-        FunctionCallEnc, MirLocalDefEnc, MirLocalDefEncTask, MirSpecEnc,
+        FunctionCallEnc, MirLocalDefEnc, MirLocalDefEncTask, MirSpecEnc, WandEnc, WandEncTask,
         mir_fn::CallTaskDescription,
         pure::spec::MirSpecEncMode,
         ty::{
@@ -35,6 +38,11 @@ pub struct TraitFnEncOutputRef<'vir> {
 
 impl<'vir> OutputRefAny for TraitFnEncOutputRef<'vir> {}
 
+#[derive(Clone, Debug)]
+pub enum TraitFnEncError {
+    Reported,
+}
+
 impl TaskEncoder for TraitFnEnc {
     task_encoder::encoder_cache!(TraitFnEnc);
     const ENCODER_NAME: &'static str = "trait fn encoder";
@@ -51,6 +59,8 @@ impl TaskEncoder for TraitFnEnc {
         Vec<vir::Function<'vir>>,
         Vec<vir::Method<'vir>>,
     );
+
+    type EncodingError = TraitFnEncError;
 
     fn emit_outputs<'vir>(program: &mut task_encoder::Program<'vir>) {
         for (dom, funcs, methods) in Self::all_outputs_local_no_errors(program) {
@@ -307,6 +317,34 @@ impl TaskEncoder for TraitFnEnc {
             {
                 let mut stub_pres = Vec::new();
                 let mut stub_posts = Vec::new();
+                let function_data = FunctionData::new(def_id);
+                let wands = deps
+                    .require_dep_spanned::<WandEnc>(
+                        WandEncTask {
+                            data: function_data,
+                        },
+                        span,
+                    )
+                    .map_err(|err| {
+                        let (message, _) = crate::encoders::mir_fn::dep_error(&err);
+                        vcx.emit_early_error(PrustiError::unsupported(
+                            format!(
+                                "cannot encode method `{}`: {message}",
+                                vcx.tcx().def_path_str(def_id),
+                            ),
+                            vcx.tcx().def_span(def_id).into(),
+                        ));
+                        EncodeFullError::EncodingError(TraitFnEncError::Reported, None)
+                    })?;
+
+                let arg_defs = deps.require_dep_spanned::<MirLocalDefEnc>(
+                    MirLocalDefEncTask::Local {
+                        def_id,
+                        all_locals: false,
+                    },
+                    span,
+                )?;
+
                 let mut args = Vec::with_capacity(arg_count + item_params.count());
                 for arg_idx in (0..arg_count).map(mir::Local::from) {
                     let name_p = local_defs[arg_idx].local.name;
@@ -316,7 +354,9 @@ impl TaskEncoder for TraitFnEnc {
                     }
                 }
                 stub_posts.push(local_defs[mir::RETURN_PLACE].impure_pred);
-                // TODO: wands
+
+                stub_pres.extend(wands.indirect_pres(vcx, &arg_defs, deps));
+                stub_posts.extend(wands.indirect_posts(vcx, &arg_defs, deps));
 
                 stub_pres.push(pre_func.call()(
                     vcx.alloc_slice(
